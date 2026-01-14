@@ -38,7 +38,7 @@ def load_model_and_config():
         model, class_mapping
     """
     # Charger le meilleur modèle
-    model_path = MODEL_DIR / "best_model.h5"
+    model_path = MODEL_DIR / "best_model_finetuned.keras"
     if not model_path.exists():
         raise FileNotFoundError(
             f"Modèle non trouvé: {model_path}\n"

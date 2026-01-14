@@ -16,7 +16,9 @@ def create_model(num_classes=7, input_shape=(224, 224, 3), trainable_layers=20):
         layer.trainable = False
     
     inputs = keras.Input(shape=input_shape)
-    x = keras.applications.mobilenet_v2.preprocess_input(inputs)
+    # Remplacer preprocess_input par Rescaling pour éviter les erreurs de sérialisation (TrueDivide)
+    # MobileNetV2 attend des pixels entre -1 et 1
+    x = layers.Rescaling(1./127.5, offset=-1)(inputs)
     x = base_model(x, training=False)
     x = layers.GlobalAveragePooling2D()(x)
     x = layers.Dropout(0.3)(x)
@@ -45,7 +47,7 @@ def get_callbacks(model_dir):
     
     callbacks = [
         keras.callbacks.ModelCheckpoint(
-            filepath=str(model_dir / "best_model.h5"),
+            filepath=str(model_dir / "best_model.keras"),
             monitor='val_accuracy',
             mode='max',
             save_best_only=True,
@@ -62,7 +64,7 @@ def get_callbacks(model_dir):
         
         keras.callbacks.EarlyStopping(
             monitor='val_accuracy',
-            patience=7,
+            patience=8,
             restore_best_weights=True,
             verbose=1
         ),
@@ -86,3 +88,31 @@ if __name__ == "__main__":
     print(f"\nNombre total de paramètres: {model.count_params():,}")
     trainable_params = sum([tf.size(w).numpy() for w in model.trainable_weights])
     print(f"Paramètres entraînables: {trainable_params:,}")
+
+
+def unfreeze_base_model(model, num_layers_unfreeze=50):
+    """
+    Décongèle les dernières couches du modèle de base pour le fine-tuning.
+    """
+    # Trouver la couche MobileNetV2
+    base_model = None
+    for layer in model.layers:
+        if isinstance(layer, keras.Model) or "mobilenet" in layer.name:
+            base_model = layer
+            break
+            
+    if base_model is None:
+        print("Attention: Modèle de base non trouvé pour le fine-tuning")
+        return model
+
+    # Décongeler le modèle de base
+    base_model.trainable = True
+    
+    # Congeler toutes les couches sauf les N dernières
+    # Note: Il est important de laisser les couches BatchNormalization gelées
+    # lors du fine-tuning pour ne pas casser les statistiques apprises
+    for layer in base_model.layers[:-num_layers_unfreeze]:
+        layer.trainable = False
+        
+    print(f"\nModèle décongelé. Les {num_layers_unfreeze} dernières couches du backbone sont entraînables.")
+    return model

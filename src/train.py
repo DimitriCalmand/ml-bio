@@ -8,8 +8,9 @@ import seaborn as sns
 from pathlib import Path
 import json
 import numpy as np
+from sklearn.utils import class_weight
 
-from model import create_model, compile_model, get_callbacks
+from model import create_model, compile_model, get_callbacks, unfreeze_base_model
 
 
 DATA_DIR = Path("data/processed")
@@ -21,7 +22,8 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 32
-EPOCHS = 30
+EPOCHS = 30  # Epochs initiales (tête seulement)
+FINE_TUNE_EPOCHS = 30  # Epochs de fine-tuning
 LEARNING_RATE = 0.001
 VALIDATION_SPLIT = 0.2
 
@@ -121,7 +123,7 @@ def plot_training_history(history, save_path):
 
 def train_model():
     print("=" * 60)
-    print("ENTRAÎNEMENT DU MODÈLE DE CLASSIFICATION")
+    print("ENTRAÎNEMENT DU MODÈLE DE CLASSIFICATION (AMÉLIORÉ)")
     print("=" * 60)
     
     if not DATA_DIR.exists():
@@ -129,8 +131,20 @@ def train_model():
         print("Veuillez d'abord exécuter: python src/download_data.py")
         return
     
+    # 1. Préparation des données
     train_ds, val_ds, class_names = create_data_generators()
     
+    # Calcul des poids de classes pour gérer le déséquilibre
+    print("\nCalcul des poids de classes...")
+    class_weights = class_weight.compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(train_ds.classes),
+        y=train_ds.classes
+    )
+    class_weights_dict = dict(enumerate(class_weights))
+    print(f"Poids: {class_weights_dict}")
+    
+    # 2. Création et compilation du modèle
     print("\nCréation du modèle...")
     model = create_model(num_classes=len(class_names))
     model = compile_model(model, learning_rate=LEARNING_RATE)
@@ -140,15 +154,53 @@ def train_model():
     
     callbacks = get_callbacks(MODEL_DIR)
     
+    # 3. Phase 1 : Entraînement Initial (Tête seulement)
     print("\n" + "=" * 60)
-    print("DÉBUT DE L'ENTRAÎNEMENT")
+    print("PHASE 1 : ENTRAÎNEMENT INITIAL (Transfer Learning)")
     print("=" * 60 + "\n")
     
-    history = model.fit(
+    history_1 = model.fit(
         train_ds,
         validation_data=val_ds,
         epochs=EPOCHS,
         callbacks=callbacks,
+        class_weight=class_weights_dict,
+        verbose=1
+    )
+    
+    # 4. Phase 2 : Fine-Tuning
+    print("\n" + "=" * 60)
+    print("PHASE 2 : FINE-TUNING (Décongélation partielle)")
+    print("=" * 60 + "\n")
+    
+    model = unfreeze_base_model(model, num_layers_unfreeze=30)
+    
+    # Recompiler avec un learning rate très faible
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=1e-5),
+        loss='categorical_crossentropy',
+        metrics=['accuracy', keras.metrics.Precision(), keras.metrics.Recall()]
+    )
+    
+    # Adapter les callbacks pour la phase 2
+    # On change le nom du fichier de checkpoint pour ne pas écraser le meilleur de la phase 1
+    callbacks[0] = keras.callbacks.ModelCheckpoint(
+        filepath=str(MODEL_DIR / "best_model_finetuned.keras"),
+        monitor='val_accuracy',
+        mode='max',
+        save_best_only=True,
+        verbose=1
+    )
+    
+    total_epochs = EPOCHS + FINE_TUNE_EPOCHS
+    
+    history_2 = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=total_epochs,
+        initial_epoch=history_1.epoch[-1] + 1,
+        callbacks=callbacks,
+        class_weight=class_weights_dict,
         verbose=1
     )
     
@@ -156,48 +208,75 @@ def train_model():
     print("ENTRAÎNEMENT TERMINÉ")
     print("=" * 60)
     
-    final_model_path = MODEL_DIR / "final_model.h5"
+    # Sauvegarde du modèle final
+    final_model_path = MODEL_DIR / "final_model_refined.keras"
     model.save(final_model_path)
     print(f"\nModèle final sauvegardé: {final_model_path}")
     
-    plot_training_history(history, RESULTS_DIR / "training_history.png")
+    # Fusionner l'historique pour le traçage
+    history_map = {}
     
-    print("\n" + "=" * 60)
-    print("RÉSUMÉ DES PERFORMANCES")
-    print("=" * 60)
+    # Fonction pour normaliser les noms de métriques (ex: precision_1 -> precision)
+    def normalize_metric_name(name):
+        if 'accuracy' in name: return 'accuracy' if 'val' not in name else 'val_accuracy'
+        if 'loss' in name: return 'loss' if 'val' not in name else 'val_loss'
+        if 'precision' in name: return 'precision' if 'val' not in name else 'val_precision'
+        if 'recall' in name: return 'recall' if 'val' not in name else 'val_recall'
+        return name
+
+    # Initialiser avec l'historique 1
+    for k, v in history_1.history.items():
+        std_name = normalize_metric_name(k)
+        history_map[std_name] = v
+
+    # Ajouter l'historique 2 en mappant les noms
+    for k, v in history_2.history.items():
+        std_name = normalize_metric_name(k)
+        if std_name in history_map:
+            history_map[std_name] = history_map[std_name] + v
+        else:
+            history_map[std_name] = v
+        
+    # Créer un objet dummy pour passer à la fonction plot
+    class HistoryDummy:
+        def __init__(self, history):
+            self.history = history
+            
+    full_history = HistoryDummy(history_map)
     
-    best_val_acc = max(history.history['val_accuracy'])
-    best_epoch = history.history['val_accuracy'].index(best_val_acc) + 1
+    plot_training_history(full_history, RESULTS_DIR / "training_history_full.png")
     
-    print(f"\nMeilleure accuracy de validation: {best_val_acc:.4f}")
-    print(f"Atteinte à l'epoch: {best_epoch}")
-    
-    final_train_acc = history.history['accuracy'][-1]
-    final_val_acc = history.history['val_accuracy'][-1]
-    
-    print(f"\nPerformances finales:")
-    print(f"  Train accuracy: {final_train_acc:.4f}")
-    print(f"  Validation accuracy: {final_val_acc:.4f}")
+    # Mise à jour du fichier de config
+    best_val_acc = max(full_history.history['val_accuracy'])
     
     config = {
         "image_size": IMAGE_SIZE,
         "batch_size": BATCH_SIZE,
-        "epochs": EPOCHS,
+        "initial_epochs": EPOCHS,
+        "finetune_epochs": FINE_TUNE_EPOCHS,
         "learning_rate": LEARNING_RATE,
-        "validation_split": VALIDATION_SPLIT,
+        "finetune_lr": 1e-5,
         "num_classes": len(class_names),
         "class_names": class_names,
         "best_val_accuracy": float(best_val_acc),
-        "best_epoch": int(best_epoch),
-        "final_train_accuracy": float(final_train_acc),
-        "final_val_accuracy": float(final_val_acc)
+        "class_weights": {k: float(v) for k, v in class_weights_dict.items()}
     }
     
     with open(MODEL_DIR / "training_config.json", 'w') as f:
         json.dump(config, f, indent=2)
     
     print(f"\nConfiguration sauvegardée: {MODEL_DIR / 'training_config.json'}")
-    print(f"\nTous les résultats sont dans: {MODEL_DIR} et {RESULTS_DIR}")
+    print(f"Meilleur modèle fine-tuné disponible à: {MODEL_DIR / 'best_model_finetuned.keras'}")
+    print(f"Modèle de la phase 1 disponible à: {MODEL_DIR / 'best_model.keras'}")
+    
+    # Mettre à jour best_model.keras avec le meilleur des deux phases
+    best_phase1 = max(history_1.history['val_accuracy'])
+    best_phase2 = max(history_2.history['val_accuracy'])
+    
+    if best_phase2 > best_phase1:
+        print("\nLe modèle fine-tuné est meilleur. Mise à jour de best_model.keras...")
+        import shutil
+        shutil.copy(MODEL_DIR / "best_model_finetuned.keras", MODEL_DIR / "best_model.keras")
 
 
 if __name__ == "__main__":
