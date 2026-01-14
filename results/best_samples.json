@@ -1,0 +1,51 @@
+{
+  "akiec": [
+    "data/split/test/akiec/ISIC_0029900.jpg",
+    "data/split/test/akiec/ISIC_0024771.jpg",
+    "data/split/test/akiec/ISIC_0029932.jpg",
+    "data/split/test/akiec/ISIC_0027950.jpg",
+    "data/split/test/akiec/ISIC_0026702.jpg"
+  ],
+  "bcc": [
+    "data/split/test/bcc/ISIC_0025102.jpg",
+    "data/split/test/bcc/ISIC_0027526.jpg",
+    "data/split/test/bcc/ISIC_0028350.jpg",
+    "data/split/test/bcc/ISIC_0026829.jpg",
+    "data/split/test/bcc/ISIC_0029951.jpg"
+  ],
+  "bkl": [
+    "data/split/test/bkl/ISIC_0032417.jpg",
+    "data/split/test/bkl/ISIC_0026248.jpg",
+    "data/split/test/bkl/ISIC_0030272.jpg",
+    "data/split/test/bkl/ISIC_0025529.jpg",
+    "data/split/test/bkl/ISIC_0031556.jpg"
+  ],
+  "df": [
+    "data/split/test/df/ISIC_0033790.jpg",
+    "data/split/test/df/ISIC_0029578.jpg",
+    "data/split/test/df/ISIC_0033891.jpg",
+    "data/split/test/df/ISIC_0032642.jpg",
+    "data/split/test/df/ISIC_0030015.jpg"
+  ],
+  "mel": [
+    "data/split/test/mel/ISIC_0027060.jpg",
+    "data/split/test/mel/ISIC_0033258.jpg",
+    "data/split/test/mel/ISIC_0033394.jpg",
+    "data/split/test/mel/ISIC_0032408.jpg",
+    "data/split/test/mel/ISIC_0032709.jpg"
+  ],
+  "nv": [
+    "data/split/test/nv/ISIC_0027001.jpg",
+    "data/split/test/nv/ISIC_0025296.jpg",
+    "data/split/test/nv/ISIC_0030576.jpg",
+    "data/split/test/nv/ISIC_0029646.jpg",
+    "data/split/test/nv/ISIC_0031312.jpg"
+  ],
+  "vasc": [
+    "data/split/test/vasc/ISIC_0028714.jpg",
+    "data/split/test/vasc/ISIC_0031706.jpg",
+    "data/split/test/vasc/ISIC_0027210.jpg",
+    "data/split/test/vasc/ISIC_0030722.jpg",
+    "data/split/test/vasc/ISIC_0025596.jpg"
+  ]
+}

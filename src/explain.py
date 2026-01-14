@@ -45,8 +45,14 @@ def load_and_preprocess_image(
             - preprocessed_array: Shape (1, H, W, 3), ready for model
             - original_image: Shape (H, W, 3), original pixel values [0, 255]
     """
-    img = keras.preprocessing.image.load_img(img_path, target_size=target_size)
-    img_array = keras.preprocessing.image.img_to_array(img)
+    try:
+        # Newer Keras/TF versions
+        img = tf.keras.utils.load_img(img_path, target_size=target_size)
+        img_array = tf.keras.utils.img_to_array(img)
+    except AttributeError:
+        # Fallback for older versions
+        img = keras.preprocessing.image.load_img(img_path, target_size=target_size)
+        img_array = keras.preprocessing.image.img_to_array(img)
     
     # Keep original for visualization
     original = img_array.copy()
@@ -113,6 +119,7 @@ class GradCAM:
         self.pre_backbone_layers = []
         self.post_backbone_layers = []
         self._backbone_grad_model = None
+        self._flat_grad_model = None
         
         for idx, layer in enumerate(self.model.layers):
             # Check if this is a nested model (backbone like MobileNetV2)
@@ -126,10 +133,18 @@ class GradCAM:
     def _find_target_layer(self) -> str:
         """
         Automatically find the last convolutional layer.
+        Prioritizes 'top_conv' for EfficientNet models.
         
         Returns:
             Name of the last convolutional layer found.
         """
+        # Specific check for EfficientNet 'top_conv'
+        try:
+            self.model.get_layer('top_conv')
+            return 'top_conv'
+        except ValueError:
+            pass
+
         # First, try to find in the backbone
         if self.backbone is not None:
             for sub_layer in reversed(self.backbone.layers):
@@ -215,13 +230,15 @@ class GradCAM:
             return conv_outputs, predictions
         else:
             # Simple case - layer is in main model (no nested backbone)
-            # Build a single grad model
-            target_layer = self.model.get_layer(self.layer_name)
-            grad_model = keras.Model(
-                inputs=self.model.input,
-                outputs=[target_layer.output, self.model.output]
-            )
-            conv_outputs, predictions = grad_model(inputs)
+            if self._flat_grad_model is None:
+                target_layer = self.model.get_layer(self.layer_name)
+                # Ensure the layer output is what we expect
+                self._flat_grad_model = keras.Model(
+                    inputs=self.model.input,
+                    outputs=[target_layer.output, self.model.output]
+                )
+            
+            conv_outputs, predictions = self._flat_grad_model(inputs)
             return conv_outputs, predictions
     
     def compute_heatmap(

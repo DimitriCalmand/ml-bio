@@ -41,7 +41,7 @@ from explain import (
 
 # Configuration
 MODEL_DIR = Path("models")
-DATA_DIR = Path("data/processed")
+DATA_DIR = Path("data/split/test") if Path("data/split/test").exists() else Path("data/processed")
 RESULTS_DIR = Path("results")
 EXPLANATIONS_DIR = RESULTS_DIR / "explanations"
 IMAGE_SIZE = (224, 224)

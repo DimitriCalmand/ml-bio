@@ -1,0 +1,26 @@
+{
+  "class_names": [
+    "akiec",
+    "bcc",
+    "bkl",
+    "df",
+    "mel",
+    "nv",
+    "vasc"
+  ],
+  "thresholds": {
+    "akiec": 0.10028253495693207,
+    "bcc": 0.16129595041275024,
+    "bkl": 0.2513386309146881,
+    "df": 0.6454707980155945,
+    "mel": 0.18271641433238983,
+    "nv": 0.14150001108646393,
+    "vasc": 0.5038743615150452
+  },
+  "critical_classes": {
+    "mel": 0.85,
+    "bcc": 0.8,
+    "akiec": 0.8
+  },
+  "description": "Optimized thresholds for safety-critical classification"
+}

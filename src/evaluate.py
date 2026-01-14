@@ -1,5 +1,6 @@
 """
-Script d'évaluation du modèle de classification.
+Script d'évaluation du modèle de classification sur le jeu de test.
+Inclut Test Time Augmentation (TTA).
 """
 
 import os
@@ -15,377 +16,171 @@ import json
 from sklearn.metrics import (
     classification_report, 
     confusion_matrix,
-    roc_curve,
-    auc
+    balanced_accuracy_score,
+    accuracy_score
 )
-from sklearn.preprocessing import label_binarize
+from tqdm import tqdm
 
+# Imports for TTA
+from tensorflow.keras import layers
 
 # Configuration
-DATA_DIR = Path("data/processed")
+DATA_DIR = Path("data/split")
+TEST_DIR = DATA_DIR / "test"
 MODEL_DIR = Path("models")
 RESULTS_DIR = Path("results")
+RESULTS_DIR.mkdir(exist_ok=True)
 
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 32
+TTA_STEPS = 5  # Number of TTA forward passes
 
+# Add Focal Loss to scope for loading
+try:
+    from tensorflow.keras.losses import CategoricalFocalCrossentropy
+except ImportError:
+    # Use standard CCE if loading fails locally, but model loading usually needs the class
+    # If the custom object was saved with the model, we need to provide it upon loading
+    class CategoricalFocalCrossentropy(keras.losses.Loss):
+         def __init__(self, alpha=0.25, gamma=2.0, from_logits=False, **kwargs):
+            super().__init__(**kwargs)
+            self.alpha = alpha
+            self.gamma = gamma
+            self.from_logits = from_logits
+         def call(self, y_true, y_pred):
+            return tf.reduce_sum(y_true, axis=-1) # Dummy implementation for loading
 
-def load_model_and_config():
-    """
-    Charge le modèle entraîné et sa configuration.
-    
-    Returns:
-        model, class_mapping
-    """
-    # Charger le meilleur modèle
-    model_path = MODEL_DIR / "best_model_finetuned.keras"
-    if not model_path.exists():
-        raise FileNotFoundError(
-            f"Modèle non trouvé: {model_path}\n"
-            "Veuillez d'abord entraîner le modèle avec: python src/train.py"
-        )
-    
-    print(f"Chargement du modèle: {model_path}")
-    model = keras.models.load_model(model_path)
-    
-    # Charger le mapping des classes
-    with open(MODEL_DIR / "class_mapping.json", 'r') as f:
-        class_mapping = json.load(f)
-    
-    # Convertir les clés en int
-    class_mapping = {int(k): v for k, v in class_mapping.items()}
-    
-    return model, class_mapping
-
-
-def create_test_generator():
-    """
-    Crée le générateur de données pour le test (utilise le split validation).
-    
-    Returns:
-        test_ds
-    """
-    datagen = keras.preprocessing.image.ImageDataGenerator(
-        validation_split=0.2
-    )
-    
-    test_ds = datagen.flow_from_directory(
-        DATA_DIR,
-        target_size=IMAGE_SIZE,
+def load_test_data():
+    if not TEST_DIR.exists():
+        raise FileNotFoundError(f"Dossier de test non trouvé: {TEST_DIR}")
+        
+    test_ds = keras.utils.image_dataset_from_directory(
+        TEST_DIR,
+        image_size=IMAGE_SIZE,
         batch_size=BATCH_SIZE,
-        class_mode='categorical',
-        subset='validation',
-        shuffle=False
+        label_mode='categorical',
+        shuffle=False 
     )
-    
-    print(f"Images de test: {test_ds.samples}")
-    
     return test_ds
 
-
-def plot_confusion_matrix(y_true, y_pred, class_names, save_path):
-    """
-    Affiche et sauvegarde la matrice de confusion.
-    
-    Args:
-        y_true: Labels vrais
-        y_pred: Labels prédits
-        class_names: Noms des classes
-        save_path: Chemin de sauvegarde
-    """
-    cm = confusion_matrix(y_true, y_pred)
-    
-    plt.figure(figsize=(12, 10))
-    sns.heatmap(
-        cm, 
-        annot=True, 
-        fmt='d', 
-        cmap='Blues',
-        xticklabels=class_names,
-        yticklabels=class_names,
-        cbar_kws={'label': 'Nombre de prédictions'}
-    )
-    plt.title('Matrice de Confusion', fontsize=16, fontweight='bold')
-    plt.ylabel('Vraie classe', fontsize=12)
-    plt.xlabel('Classe prédite', fontsize=12)
-    plt.xticks(rotation=45, ha='right')
-    plt.yticks(rotation=0)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"Matrice de confusion sauvegardée: {save_path}")
-    plt.close()
-
-
-def plot_roc_curves(y_true, y_pred_proba, class_names, save_path):
-    """
-    Trace les courbes ROC pour chaque classe.
-    
-    Args:
-        y_true: Labels vrais (one-hot encoded)
-        y_pred_proba: Probabilités prédites
-        class_names: Noms des classes
-        save_path: Chemin de sauvegarde
-    """
-    n_classes = len(class_names)
-    
-    # Calculer ROC pour chaque classe
-    fpr = dict()
-    tpr = dict()
-    roc_auc = dict()
-    
-    for i in range(n_classes):
-        fpr[i], tpr[i], _ = roc_curve(y_true[:, i], y_pred_proba[:, i])
-        roc_auc[i] = auc(fpr[i], tpr[i])
-    
-    # Plot
-    plt.figure(figsize=(12, 8))
-    colors = plt.cm.rainbow(np.linspace(0, 1, n_classes))
-    
-    for i, color in enumerate(colors):
-        plt.plot(
-            fpr[i], 
-            tpr[i], 
-            color=color, 
-            lw=2,
-            label=f'{class_names[i]} (AUC = {roc_auc[i]:.3f})'
-        )
-    
-    plt.plot([0, 1], [0, 1], 'k--', lw=2, label='Hasard (AUC = 0.5)')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('Taux de Faux Positifs', fontsize=12)
-    plt.ylabel('Taux de Vrais Positifs', fontsize=12)
-    plt.title('Courbes ROC par Classe', fontsize=16, fontweight='bold')
-    plt.legend(loc="lower right", fontsize=9)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"Courbes ROC sauvegardées: {save_path}")
-    plt.close()
-    
-    return roc_auc
-
-
-def plot_class_performance(report_dict, class_names, save_path):
-    """
-    Visualise les performances par classe.
-    
-    Args:
-        report_dict: Rapport de classification (dict)
-        class_names: Noms des classes
-        save_path: Chemin de sauvegarde
-    """
-    metrics = ['precision', 'recall', 'f1-score']
-    scores = {metric: [] for metric in metrics}
-    
-    for class_name in class_names:
-        for metric in metrics:
-            scores[metric].append(report_dict[class_name][metric])
-    
-    x = np.arange(len(class_names))
-    width = 0.25
-    
-    fig, ax = plt.subplots(figsize=(14, 6))
-    
-    for i, metric in enumerate(metrics):
-        offset = width * (i - 1)
-        ax.bar(x + offset, scores[metric], width, label=metric.capitalize())
-    
-    ax.set_xlabel('Classes', fontsize=12)
-    ax.set_ylabel('Score', fontsize=12)
-    ax.set_title('Performances par Classe', fontsize=16, fontweight='bold')
-    ax.set_xticks(x)
-    ax.set_xticklabels(class_names, rotation=45, ha='right')
-    ax.legend()
-    ax.set_ylim([0, 1])
-    ax.grid(True, alpha=0.3, axis='y')
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"Performances par classe sauvegardées: {save_path}")
-    plt.close()
-
-
-def visualize_predictions(model, test_ds, class_names, num_images=16):
-    """
-    Visualise quelques prédictions du modèle.
-    
-    Args:
-        model: Modèle entraîné
-        test_ds: Générateur de test
-        class_names: Noms des classes
-        num_images: Nombre d'images à afficher
-    """
-    # Récupérer un batch d'images
-    images, labels = next(iter(test_ds))
-    num_images = min(num_images, len(images))
-    
-    # Faire les prédictions
-    predictions = model.predict(images[:num_images], verbose=0)
-    
-    # Visualiser
-    fig, axes = plt.subplots(4, 4, figsize=(16, 16))
-    axes = axes.ravel()
-    
-    for i in range(num_images):
-        # Dénormaliser l'image pour l'affichage
-        img = images[i]
-        img = (img - img.min()) / (img.max() - img.min())
+def load_model_and_classes():
+    model_path = MODEL_DIR / "best_model_finetuned.keras"
+    if not model_path.exists():
+         model_path = MODEL_DIR / "best_model.keras"
+         
+    if not model_path.exists():
+        raise FileNotFoundError("Aucun modèle trouvé dans models/")
         
-        true_label = class_names[np.argmax(labels[i])]
-        pred_label = class_names[np.argmax(predictions[i])]
-        confidence = np.max(predictions[i])
-        
-        color = 'green' if true_label == pred_label else 'red'
-        
-        axes[i].imshow(img)
-        axes[i].set_title(
-            f'Vrai: {true_label}\n'
-            f'Prédit: {pred_label}\n'
-            f'Confiance: {confidence:.2%}',
-            color=color,
-            fontsize=10
-        )
-        axes[i].axis('off')
+    print(f"Chargement du modèle: {model_path}")
     
-    plt.tight_layout()
-    save_path = RESULTS_DIR / "sample_predictions.png"
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"Exemples de prédictions sauvegardés: {save_path}")
-    plt.close()
+    # Register custom objects
+    custom_objects = {"CategoricalFocalCrossentropy": CategoricalFocalCrossentropy}
+    
+    try:
+        model = keras.models.load_model(model_path, custom_objects=custom_objects)
+    except Exception as e:
+        print(f"Standard loading failed ({e}), trying without custom objects compilation...")
+        model = keras.models.load_model(model_path, compile=False)
+    
+    with open(MODEL_DIR / "class_mapping.json", 'r') as f:
+        class_mapping_raw = json.load(f)
+        class_mapping = {int(k): v for k, v in class_mapping_raw.items()}
+        
+    return model, class_mapping
 
+def tta_predict(model, dataset, steps=5):
+    """
+    Test Time Augmentation:
+    Predict 'steps' times on augmented versions of the image and average the results.
+    """
+    print(f"Performing TTA with {steps} steps...")
+    
+    # Define TTA augmentation layer (lighter than training)
+    tta_layers = keras.Sequential([
+        layers.RandomFlip("horizontal"),
+        layers.RandomRotation(0.1),
+        layers.RandomZoom(0.05),
+    ])
+    
+    # Get all images and labels as arrays first
+    all_images = []
+    all_labels = []
+    
+    # Unpack dataset (careful with memory if dataset is >10GB, but HAM10000 test is small)
+    for imgs, lbls in dataset:
+        all_images.append(imgs.numpy())
+        all_labels.append(lbls.numpy())
+        
+    X_test = np.concatenate(all_images)
+    y_true = np.concatenate(all_labels)
+    
+    # 1. Standard Prediction (No Augmentation)
+    print("  Step 0: Standard prediction")
+    probs = model.predict(X_test, batch_size=BATCH_SIZE, verbose=1)
+    
+    # 2. Augmented Predictions
+    for i in range(steps - 1):
+        print(f"  Step {i+1}: Augmented prediction")
+        # Apply augmentation
+        # Note: We need to do this batch-wise or array-wise
+        # tf.keras layers can take numpy arrays
+        X_aug = tta_layers(X_test, training=True) # training=True activates the layers
+        p = model.predict(X_aug, batch_size=BATCH_SIZE, verbose=0)
+        probs += p
+        
+    # Average
+    probs /= steps
+    
+    return probs, y_true
 
 def evaluate_model():
-    """
-    Fonction principale d'évaluation.
-    """
-    print("=" * 60)
-    print("ÉVALUATION DU MODÈLE")
-    print("=" * 60)
+    print("="*60)
+    print("ÉVALUATION DU MODÈLE (HOLD-OUT TEST SET)")
+    print("="*60)
     
-    # Charger le modèle et la configuration
-    model, class_mapping = load_model_and_config()
-    class_names = [class_mapping[i] for i in sorted(class_mapping.keys())]
+    # 1. Load Data & Model
+    test_ds = load_test_data()
+    model, class_mapping = load_model_and_classes()
+    class_names = [class_mapping[i] for i in range(len(class_mapping))]
     
-    print(f"\nNombre de classes: {len(class_names)}")
-    print(f"Classes: {class_names}")
+    # 2. Prediction with TTA
+    if TTA_STEPS > 1:
+        y_pred_probs, y_true_onehot = tta_predict(model, test_ds, steps=TTA_STEPS)
+    else:
+        y_pred_probs = model.predict(test_ds, verbose=1)
+        y_true_onehot = np.concatenate([y for x, y in test_ds], axis=0)
+        
+    y_pred = np.argmax(y_pred_probs, axis=1)
+    y_true_cls = np.argmax(y_true_onehot, axis=1)
     
-    # Créer le générateur de test
-    print("\nChargement des données de test...")
-    test_ds = create_test_generator()
+    # 3. Metrics
+    acc = accuracy_score(y_true_cls, y_pred)
+    balanced_acc = balanced_accuracy_score(y_true_cls, y_pred)
     
-    # Évaluation globale
-    print("\n" + "=" * 60)
-    print("ÉVALUATION SUR LE JEU DE TEST")
-    print("=" * 60)
+    print("\n" + "="*40)
+    print(f"Accuracy: {acc:.4f}")
+    print(f"Balanced Accuracy: {balanced_acc:.4f}")
+    print("="*40)
     
-    results = model.evaluate(test_ds, verbose=1)
-    metrics_names = model.metrics_names
+    print("\nRapport de Classification:")
+    print(classification_report(y_true_cls, y_pred, target_names=class_names))
     
-    print("\nRésultats globaux:")
-    for name, value in zip(metrics_names, results):
-        print(f"  {name}: {value:.4f}")
+    # Save Report
+    report = classification_report(y_true_cls, y_pred, target_names=class_names, output_dict=True)
+    with open(RESULTS_DIR / "evaluation_report.json", "w") as f:
+        json.dump(report, f, indent=2)
+        
+    # 4. Confusion Matrix
+    cm = confusion_matrix(y_true_cls, y_pred)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
+    plt.xlabel('Prédiction')
+    plt.ylabel('Réalité')
+    plt.title(f'Matrice de Confusion (TTA={TTA_STEPS})')
+    plt.savefig(RESULTS_DIR / "confusion_matrix.png")
+    plt.close()
     
-    # Prédictions complètes
-    print("\nGénération des prédictions...")
-    test_ds.reset()
-    y_pred_proba = model.predict(test_ds, verbose=1)
-    y_pred = np.argmax(y_pred_proba, axis=1)
-    y_true = test_ds.classes
-    
-    # Matrice de confusion
-    print("\nGénération de la matrice de confusion...")
-    plot_confusion_matrix(
-        y_true, 
-        y_pred, 
-        class_names,
-        RESULTS_DIR / "confusion_matrix.png"
-    )
-    
-    # Rapport de classification
-    print("\n" + "=" * 60)
-    print("RAPPORT DE CLASSIFICATION")
-    print("=" * 60)
-    
-    report = classification_report(
-        y_true, 
-        y_pred, 
-        target_names=class_names,
-        digits=4
-    )
-    print("\n" + report)
-    
-    # Sauvegarder le rapport
-    with open(RESULTS_DIR / "classification_report.txt", 'w') as f:
-        f.write(report)
-    print(f"Rapport sauvegardé: {RESULTS_DIR / 'classification_report.txt'}")
-    
-    # Rapport détaillé (dict)
-    report_dict = classification_report(
-        y_true, 
-        y_pred, 
-        target_names=class_names,
-        output_dict=True
-    )
-    
-    # Performances par classe
-    print("\nGénération des graphiques de performances...")
-    plot_class_performance(
-        report_dict,
-        class_names,
-        RESULTS_DIR / "class_performance.png"
-    )
-    
-    # Courbes ROC
-    print("Génération des courbes ROC...")
-    y_true_onehot = label_binarize(y_true, classes=range(len(class_names)))
-    roc_auc = plot_roc_curves(
-        y_true_onehot,
-        y_pred_proba,
-        class_names,
-        RESULTS_DIR / "roc_curves.png"
-    )
-    
-    # Visualiser quelques prédictions
-    print("Génération d'exemples de prédictions...")
-    visualize_predictions(model, test_ds, class_names)
-    
-    # Résumé final
-    print("\n" + "=" * 60)
-    print("RÉSUMÉ DE L'ÉVALUATION")
-    print("=" * 60)
-    
-    print(f"\nAccuracy globale: {report_dict['accuracy']:.4f}")
-    print(f"Macro-average F1-score: {report_dict['macro avg']['f1-score']:.4f}")
-    print(f"Weighted-average F1-score: {report_dict['weighted avg']['f1-score']:.4f}")
-    
-    print("\nAUC moyen par classe:")
-    for i, class_name in enumerate(class_names):
-        print(f"  {class_name}: {roc_auc[i]:.4f}")
-    
-    # Sauvegarder les résultats d'évaluation
-    eval_results = {
-        "accuracy": float(report_dict['accuracy']),
-        "macro_f1": float(report_dict['macro avg']['f1-score']),
-        "weighted_f1": float(report_dict['weighted avg']['f1-score']),
-        "per_class": {
-            class_names[i]: {
-                "precision": float(report_dict[class_names[i]]['precision']),
-                "recall": float(report_dict[class_names[i]]['recall']),
-                "f1-score": float(report_dict[class_names[i]]['f1-score']),
-                "support": int(report_dict[class_names[i]]['support']),
-                "auc": float(roc_auc[i])
-            }
-            for i in range(len(class_names))
-        }
-    }
-    
-    with open(RESULTS_DIR / "evaluation_results.json", 'w') as f:
-        json.dump(eval_results, f, indent=2)
-    
-    print(f"\nRésultats détaillés sauvegardés: {RESULTS_DIR / 'evaluation_results.json'}")
-    print(f"\nTous les graphiques sont dans: {RESULTS_DIR}")
-
+    print(f"\nRésultats sauvegardés dans {RESULTS_DIR}")
 
 if __name__ == "__main__":
     evaluate_model()

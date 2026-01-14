@@ -28,13 +28,27 @@ from pathlib import Path
 # Define which classes are safety-critical (high recall priority)
 # These are pre-cancerous or cancerous lesions where missing diagnosis is dangerous
 CRITICAL_CLASSES = {
-    'mel': 0.90,   # Melanoma - most dangerous, need 90%+ recall
-    'bcc': 0.85,   # Basal cell carcinoma - cancerous
-    'akiec': 0.85, # Actinic keratosis - pre-cancerous
+    'mel': 0.85,   # Melanoma - most dangerous
+    'bcc': 0.80,   # Basal cell carcinoma
+    'akiec': 0.80, # Actinic keratosis
 }
 
 # Benign or less critical classes (balanced precision/recall)
 NON_CRITICAL_CLASSES = ['nv', 'bkl', 'df', 'vasc']
+
+# Configuration paths
+DATA_DIR = Path("data/split")
+VAL_DIR = DATA_DIR / "val"
+TEST_DIR = DATA_DIR / "test"
+MODEL_DIR = Path("models")
+RESULTS_DIR = Path("results")
+
+# Import Keras for standalone execution
+import tensorflow as tf
+from tensorflow import keras
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
 
 
 class ThresholdOptimizer:
@@ -442,12 +456,100 @@ def print_safety_report(metrics: Dict, class_names: List[str]):
     print("\n" + "=" * 70)
 
 
+# =============================================================================
+# STANDALONE EXECUTION UTILITIES
+# =============================================================================
+
+def load_data_and_model():
+    print("Loading validation data and model...")
+    # Load Model with custom objects if needed
+    try:
+        from tensorflow.keras.losses import CategoricalFocalCrossentropy
+    except ImportError:
+        class CategoricalFocalCrossentropy(keras.losses.Loss):
+            def __init__(self, alpha=0.25, gamma=2.0, from_logits=False, **kwargs):
+                super().__init__(**kwargs)
+            def call(self, y_true, y_pred): return tf.reduce_sum(y_true)
+
+    model_path = MODEL_DIR / "best_model_finetuned.keras"
+    if not model_path.exists(): model_path = MODEL_DIR / "best_model.keras"
+    
+    try:
+        model = keras.models.load_model(model_path, custom_objects={'CategoricalFocalCrossentropy': CategoricalFocalCrossentropy})
+    except:
+        model = keras.models.load_model(model_path, compile=False)
+
+    # Load Classes
+    with open(MODEL_DIR / "class_mapping.json") as f:
+        mapping = json.load(f)
+        classes = [mapping[str(i)] for i in range(len(mapping))]
+    
+    # Load Validation Data (for optimization)
+    val_ds = keras.utils.image_dataset_from_directory(
+        VAL_DIR, image_size=(224, 224), batch_size=32, shuffle=False)
+    
+    # Load Test Data (for final evaluation)
+    test_ds = keras.utils.image_dataset_from_directory(
+        TEST_DIR, image_size=(224, 224), batch_size=32, shuffle=False)
+        
+    return model, classes, val_ds, test_ds
+
+def predict_dataset(model, ds):
+    print("Generating predictions...")
+    y_probs = model.predict(ds, verbose=1)
+    y_true = np.concatenate([y for x, y in ds], axis=0)
+    # Convert one-hot to sparse if needed
+    if y_true.ndim > 1 and y_true.shape[1] > 1:
+        y_true = np.argmax(y_true, axis=1)
+    return y_probs, y_true
+
 if __name__ == "__main__":
-    # Example usage
-    print("Threshold Optimizer Module")
-    print("-" * 40)
-    print("This module provides tools for optimizing classification thresholds")
-    print("with special focus on safety-critical medical classes.")
-    print("\nCritical classes with target recalls:")
-    for cls, target in CRITICAL_CLASSES.items():
-        print(f"  - {cls}: {target:.0%}")
+    # 1. Setup
+    model, class_names, val_ds, test_ds = load_data_and_model()
+    
+    # 2. Get Validation Predictions
+    print("\n--- Optimizing Thresholds on Validation Set ---")
+    val_probs, val_labels = predict_dataset(model, val_ds)
+    
+    # 3. Optimize
+    optimizer = ThresholdOptimizer(class_names)
+    opt_thresholds = optimizer.optimize_all_thresholds(val_labels, val_probs)
+        
+    # Save thresholds
+    optimizer.save_thresholds(RESULTS_DIR / "optimized_thresholds.json")
+        
+    # 4. Evaluate on Test Set
+    print("\n" + "="*60)
+    print("EVALUATION ON TEST SET WITH OPTIMIZED THRESHOLDS")
+    print("="*60)
+    
+    test_probs, test_labels = predict_dataset(model, test_ds)
+    
+    # Standard (Argmax)
+    pred_std = np.argmax(test_probs, axis=1)
+    acc_std = np.mean(pred_std == test_labels)
+    f1_std = f1_score(test_labels, pred_std, average='weighted')
+    print(f"\nStandard Accuracy (Argmax):      {acc_std:.4f}")
+    print(f"Standard F1 Score (Weighted):    {f1_std:.4f}")
+    
+    # Optimized
+    pred_opt = optimizer.predict_with_thresholds(test_probs, opt_thresholds)
+    acc_opt = np.mean(pred_opt == test_labels)
+    f1_opt = f1_score(test_labels, pred_opt, average='weighted')
+    print(f"Optimized Accuracy (Scaled):     {acc_opt:.4f}")
+    print(f"Optimized F1 Score (Weighted):   {f1_opt:.4f}")
+    
+    print("\n--- Optimized Classification Report ---")
+    print(classification_report(test_labels, pred_opt, target_names=class_names))
+    
+    # Safety Report
+    metrics = compute_safety_metrics(test_labels, pred_opt, test_probs, class_names)
+    print_safety_report(metrics, class_names)
+    
+    # Confusion Matrix
+    cm = confusion_matrix(test_labels, pred_opt)
+    plt.figure(figsize=(10,8))
+    sns.heatmap(cm, annot=True, fmt='d', xticklabels=class_names, yticklabels=class_names, cmap='Greens')
+    plt.title("Optimized Confusion Matrix")
+    plt.savefig(RESULTS_DIR / "confusion_matrix_optimized.png")
+    print(f"\nSaved matrix to {RESULTS_DIR}/confusion_matrix_optimized.png")

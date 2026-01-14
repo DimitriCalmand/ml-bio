@@ -119,9 +119,9 @@ if __name__ == "__main__":
         print("2. Extraire dans le dossier 'data/raw/'")
         print("3. Relancer ce script")
     
-    # Préparer le dataset (utiliser un sous-ensemble de 500 images par classe)
-    # Pour utiliser toutes les images, passez sample_size=None
-    prepare_dataset(sample_size=500)
+    # Préparer le dataset (utiliser tout le dataset)
+    # Modification: sample_size=None pour utiliser toutes les images disponibles
+    prepare_dataset(sample_size=None)
     
     print("\n" + "=" * 60)
     print("PRÉPARATION TERMINÉE!")

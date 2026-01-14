@@ -4,16 +4,16 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import tensorflow as tf
 from tensorflow import keras
 import matplotlib.pyplot as plt
-import seaborn as sns
 from pathlib import Path
 import json
 import numpy as np
-from sklearn.utils import class_weight
 
 from model import create_model, compile_model, get_callbacks, unfreeze_base_model
 
-
-DATA_DIR = Path("data/processed")
+# Constants
+DATA_DIR = Path("data/split")
+TRAIN_DIR = DATA_DIR / "train"
+VAL_DIR = DATA_DIR / "val"
 MODEL_DIR = Path("models")
 RESULTS_DIR = Path("results")
 
@@ -22,141 +22,191 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 32
-EPOCHS = 30  # Epochs initiales (tête seulement)
-FINE_TUNE_EPOCHS = 30  # Epochs de fine-tuning
-LEARNING_RATE = 0.001
-VALIDATION_SPLIT = 0.2
+EPOCHS = 10     # Reduced epochs because steps_per_epoch is much larger now
+FINE_TUNE_EPOCHS = 20
+LEARNING_RATE = 1e-3
 
+# MixUp Configuration
+MIXUP_ALPHA = 0.2
 
-def create_data_generators():
-    print("Chargement des données...")
+def mix_up(images, labels, alpha=0.2):
+    """
+    Applies MixUp augmentation to a batch of images and labels.
+    """
+    batch_size = tf.shape(images)[0]
     
-    train_datagen = keras.preprocessing.image.ImageDataGenerator(
-        validation_split=VALIDATION_SPLIT,
-        rotation_range=20,
-        width_shift_range=0.2,
-        height_shift_range=0.2,
-        horizontal_flip=True,
-        vertical_flip=True,
-        zoom_range=0.2,
-        fill_mode='nearest'
+    # Sample lambda from Beta distribution
+    # Note: KerasCV has a MixUp layer, but manual implementation is safer for dependencies
+    # Gamma distribution with alpha=beta mimics Beta distribution
+    weight = tf.random.gamma([batch_size], alpha, 1.0)
+    beta = tf.random.gamma([batch_size], 1.0, alpha)
+    gamma = weight / (weight + beta)
+    
+    # Reshape for broadcasting to image shape
+    gamma_images = tf.reshape(gamma, [-1, 1, 1, 1])
+    
+    # Shuffle the batch
+    indices = tf.range(batch_size)
+    shuffled_indices = tf.random.shuffle(indices)
+    
+    images_mix = gamma_images * images + (1 - gamma_images) * tf.gather(images, shuffled_indices)
+    
+    # Labels mix
+    gamma_labels = tf.reshape(gamma, [-1, 1])
+    labels_mix = gamma_labels * labels + (1 - gamma_labels) * tf.gather(labels, shuffled_indices)
+    
+    return images_mix, labels_mix
+
+def create_balanced_dataset(data_dir, batch_size=32):
+    """
+    Creates a balanced dataset via Oversampling and MixUp.
+    """
+    data_dir = Path(data_dir)
+    class_names = sorted([d.name for d in data_dir.iterdir() if d.is_dir()])
+    
+    datasets = []
+    
+    print("Creating balanced dataset (Oversampling + MixUp)...")
+    for cls in class_names:
+        cls_dir = data_dir / cls
+        # Create dataset for this class
+        ds = keras.utils.image_dataset_from_directory(
+            cls_dir,
+            labels=None, 
+            image_size=IMAGE_SIZE,
+            batch_size=None, 
+            shuffle=True,
+            seed=42,
+            verbose=0
+        )
+        
+        # Add label
+        label_int = class_names.index(cls)
+        # Convert to one-hot
+        ds = ds.map(lambda x: (x, tf.one_hot(label_int, len(class_names))))
+        
+        # Repeat indefinitely to allow sampling
+        ds = ds.repeat()
+        datasets.append(ds)
+        
+    # Sample uniformly from all classes
+    balanced_ds = tf.data.Dataset.sample_from_datasets(
+        datasets,
+        weights=[1.0] * len(class_names)
     )
     
-    val_datagen = keras.preprocessing.image.ImageDataGenerator(
-        validation_split=VALIDATION_SPLIT
+    # Batch first
+    balanced_ds = balanced_ds.batch(batch_size)
+    
+    # Apply MixUp
+    balanced_ds = balanced_ds.map(
+        lambda x, y: mix_up(x, y, alpha=MIXUP_ALPHA),
+        num_parallel_calls=tf.data.AUTOTUNE
     )
     
-    train_ds = train_datagen.flow_from_directory(
-        DATA_DIR,
-        target_size=IMAGE_SIZE,
+    # Prefetch
+    balanced_ds = balanced_ds.prefetch(tf.data.AUTOTUNE)
+    
+    # Calculate steps to ensure we see the majority class fully each epoch
+    # Formula: steps * batch_size * (1/num_classes) >= max_class_count
+    # Therefore: steps >= (max_class_count * num_classes) / batch_size
+    counts = [len(list((data_dir/cls).glob('*.jpg'))) for cls in class_names]
+    max_count = max(counts)
+    
+    # We set steps so that statistically we cover the majority class once per epoch
+    steps_per_epoch = int((max_count * len(class_names)) // batch_size)
+    
+    print(f"Distribution Optimization:")
+    print(f"  - Majority Class Count: {max_count}")
+    print(f"  - Required Steps/Epoch: {steps_per_epoch}")
+    print(f"  - Samples per Epoch: {steps_per_epoch * batch_size}")
+    
+    return balanced_ds, class_names, steps_per_epoch
+
+def verify_distribution(dataset, class_names, num_batches=5):
+    """
+    Verifies that the dataset is actually producing a balanced distribution.
+    """
+    print(f"\nVerifying Batch Distribution (Checking {num_batches} batches)...")
+    
+    counts = {name: 0 for name in class_names}
+    total = 0
+    
+    # Take a few batches
+    for _, labels_batch in dataset.take(num_batches):
+        # labels_mix are soft labels due to MixUp, so we take argmax to see dominant class
+        # or just sum them up if they are one-hot/mixed
+        # Since MixUp is on, labels are float. We can sum probabilities.
+        for label in labels_batch:
+            # label shape (7,)
+            for i, prob in enumerate(label):
+                counts[class_names[i]] += float(prob)
+            total += 1
+            
+    print("Effective Class Distribution in Batches:")
+    for name, count in counts.items():
+        percentage = (count / total) * 100
+        print(f"  - {name:<6}: {percentage:.1f}% (Target: {100/len(class_names):.1f}%)")
+    print("Distribution verification complete.\n")
+
+def create_val_dataset(data_dir):
+    ds = keras.utils.image_dataset_from_directory(
+        data_dir,
+        image_size=IMAGE_SIZE,
         batch_size=BATCH_SIZE,
-        class_mode='categorical',
-        subset='training',
-        shuffle=True,
-        seed=42
+        label_mode='categorical',
+        shuffle=False
     )
-    
-    val_ds = val_datagen.flow_from_directory(
-        DATA_DIR,
-        target_size=IMAGE_SIZE,
-        batch_size=BATCH_SIZE,
-        class_mode='categorical',
-        subset='validation',
-        shuffle=False,
-        seed=42
-    )
-    
-    class_names = list(train_ds.class_indices.keys())
-    
-    print(f"\nNombre de classes: {len(class_names)}")
-    print(f"Classes: {class_names}")
-    print(f"Images d'entraînement: {train_ds.samples}")
-    print(f"Images de validation: {val_ds.samples}")
-    
-    class_mapping = {idx: name for name, idx in train_ds.class_indices.items()}
-    with open(MODEL_DIR / "class_mapping.json", 'w') as f:
-        json.dump(class_mapping, f, indent=2)
-    
-    return train_ds, val_ds, class_names
-
+    return ds.prefetch(tf.data.AUTOTUNE)
 
 def plot_training_history(history, save_path):
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    metrics = ['accuracy', 'loss', 'auc']
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
     
-    axes[0, 0].plot(history.history['accuracy'], label='Train')
-    axes[0, 0].plot(history.history['val_accuracy'], label='Validation')
-    axes[0, 0].set_title('Accuracy')
-    axes[0, 0].set_xlabel('Epoch')
-    axes[0, 0].set_ylabel('Accuracy')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True)
-    
-    axes[0, 1].plot(history.history['loss'], label='Train')
-    axes[0, 1].plot(history.history['val_loss'], label='Validation')
-    axes[0, 1].set_title('Loss')
-    axes[0, 1].set_xlabel('Epoch')
-    axes[0, 1].set_ylabel('Loss')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True)
-    
-    axes[1, 0].plot(history.history['precision'], label='Train')
-    axes[1, 0].plot(history.history['val_precision'], label='Validation')
-    axes[1, 0].set_title('Precision')
-    axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].set_ylabel('Precision')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True)
-    
-    axes[1, 1].plot(history.history['recall'], label='Train')
-    axes[1, 1].plot(history.history['val_recall'], label='Validation')
-    axes[1, 1].set_title('Recall')
-    axes[1, 1].set_xlabel('Epoch')
-    axes[1, 1].set_ylabel('Recall')
-    axes[1, 1].legend()
-    axes[1, 1].grid(True)
-    
+    for i, metric in enumerate(metrics):
+        if metric in history.history:
+            axes[i].plot(history.history[metric], label=f'Train {metric}')
+            axes[i].plot(history.history[f'val_{metric}'], label=f'Val {metric}')
+            axes[i].set_title(metric.upper())
+            axes[i].set_xlabel('Epoch')
+            axes[i].legend()
+            axes[i].grid(True)
+            
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"Graphique d'entraînement sauvegardé: {save_path}")
+    plt.savefig(save_path)
     plt.close()
 
+def main():
+    print("=" * 60)
+    print("TRAINING SKIN DISEASE CLASSIFIER")
+    print("Strategy: EfficientNetB1 + Focal Loss + Oversampling + MixUp + Strong Augmentation")
+    print("=" * 60)
+    
+    # 1. Data Preparation
+    train_ds, class_names, steps_per_epoch = create_balanced_dataset(TRAIN_DIR, BATCH_SIZE)
+    val_ds = create_val_dataset(VAL_DIR)
+    
+    # Verify the balanced nature
+    verify_distribution(train_ds, class_names)
+    
+    print(f"\nClasses: {class_names}")
+    print(f"Steps per epoch: {steps_per_epoch}")
+    
+    # Save mapping
+    class_mapping = {i: name for i, name in enumerate(class_names)}
+    with open(MODEL_DIR / "class_mapping.json", 'w') as f:
+        json.dump(class_mapping, f, indent=2)
 
-def train_model():
-    print("=" * 60)
-    print("ENTRAÎNEMENT DU MODÈLE DE CLASSIFICATION (AMÉLIORÉ)")
-    print("=" * 60)
-    
-    if not DATA_DIR.exists():
-        print(f"\nErreur: Le dossier {DATA_DIR} n'existe pas.")
-        print("Veuillez d'abord exécuter: python src/download_data.py")
-        return
-    
-    # 1. Préparation des données
-    train_ds, val_ds, class_names = create_data_generators()
-    
-    # Calcul des poids de classes pour gérer le déséquilibre
-    print("\nCalcul des poids de classes...")
-    class_weights = class_weight.compute_class_weight(
-        class_weight='balanced',
-        classes=np.unique(train_ds.classes),
-        y=train_ds.classes
-    )
-    class_weights_dict = dict(enumerate(class_weights))
-    print(f"Poids: {class_weights_dict}")
-    
-    # 2. Création et compilation du modèle
-    print("\nCréation du modèle...")
+    # 2. Model Creation
+    print("\nInitializing model...")
     model = create_model(num_classes=len(class_names))
     model = compile_model(model, learning_rate=LEARNING_RATE)
     
-    print("\nArchitecture du modèle:")
-    model.summary()
+    callbacks = get_callbacks(MODEL_DIR, append=False)
     
-    callbacks = get_callbacks(MODEL_DIR)
-    
-    # 3. Phase 1 : Entraînement Initial (Tête seulement)
+    # 3. Phase 1: Train Head
     print("\n" + "=" * 60)
-    print("PHASE 1 : ENTRAÎNEMENT INITIAL (Transfer Learning)")
+    print("PHASE 1: TRAINING HEAD")
     print("=" * 60 + "\n")
     
     history_1 = model.fit(
@@ -164,131 +214,39 @@ def train_model():
         validation_data=val_ds,
         epochs=EPOCHS,
         callbacks=callbacks,
-        class_weight=class_weights_dict,
-        verbose=1
+        steps_per_epoch=steps_per_epoch
     )
     
-    # 4. Phase 2 : Fine-Tuning
+    # 4. Phase 2: Fine-Tuning
     print("\n" + "=" * 60)
-    print("PHASE 2 : FINE-TUNING (Décongélation partielle)")
+    print("PHASE 2: FINE-TUNING BACKBONE")
     print("=" * 60 + "\n")
     
-    model = unfreeze_base_model(model, num_layers_unfreeze=30)
+    model = unfreeze_base_model(model, num_layers_unfreeze=40)
     
-    # Recompiler avec un learning rate très faible
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=1e-5),
-        loss='categorical_crossentropy',
-        metrics=['accuracy', keras.metrics.Precision(), keras.metrics.Recall()]
-    )
+    # Low learning rate for fine-tuning
+    model = compile_model(model, learning_rate=1e-5, weight_decay=1e-4) # Reduced weight decay
     
-    # Adapter les callbacks pour la phase 2
-    # On change le nom du fichier de checkpoint pour ne pas écraser le meilleur de la phase 1
+    # Update callbacks for phase 2 (append=True to keep log)
+    callbacks = get_callbacks(MODEL_DIR, append=True)
     callbacks[0] = keras.callbacks.ModelCheckpoint(
         filepath=str(MODEL_DIR / "best_model_finetuned.keras"),
-        monitor='val_accuracy',
+        monitor='val_auc',
         mode='max',
         save_best_only=True,
         verbose=1
     )
     
-    total_epochs = EPOCHS + FINE_TUNE_EPOCHS
-    
     history_2 = model.fit(
         train_ds,
         validation_data=val_ds,
-        epochs=total_epochs,
-        initial_epoch=history_1.epoch[-1] + 1,
+        epochs=FINE_TUNE_EPOCHS,
         callbacks=callbacks,
-        class_weight=class_weights_dict,
-        verbose=1
+        steps_per_epoch=steps_per_epoch
     )
     
-    print("\n" + "=" * 60)
-    print("ENTRAÎNEMENT TERMINÉ")
-    print("=" * 60)
-    
-    # Sauvegarde du modèle final
-    final_model_path = MODEL_DIR / "final_model_refined.keras"
-    model.save(final_model_path)
-    print(f"\nModèle final sauvegardé: {final_model_path}")
-    
-    # Fusionner l'historique pour le traçage
-    history_map = {}
-    
-    # Fonction pour normaliser les noms de métriques (ex: precision_1 -> precision)
-    def normalize_metric_name(name):
-        if 'accuracy' in name: return 'accuracy' if 'val' not in name else 'val_accuracy'
-        if 'loss' in name: return 'loss' if 'val' not in name else 'val_loss'
-        if 'precision' in name: return 'precision' if 'val' not in name else 'val_precision'
-        if 'recall' in name: return 'recall' if 'val' not in name else 'val_recall'
-        return name
-
-    # Initialiser avec l'historique 1
-    for k, v in history_1.history.items():
-        std_name = normalize_metric_name(k)
-        history_map[std_name] = v
-
-    # Ajouter l'historique 2 en mappant les noms
-    for k, v in history_2.history.items():
-        std_name = normalize_metric_name(k)
-        if std_name in history_map:
-            history_map[std_name] = history_map[std_name] + v
-        else:
-            history_map[std_name] = v
-        
-    # Créer un objet dummy pour passer à la fonction plot
-    class HistoryDummy:
-        def __init__(self, history):
-            self.history = history
-            
-    full_history = HistoryDummy(history_map)
-    
-    plot_training_history(full_history, RESULTS_DIR / "training_history_full.png")
-    
-    # Mise à jour du fichier de config
-    best_val_acc = max(full_history.history['val_accuracy'])
-    
-    config = {
-        "image_size": IMAGE_SIZE,
-        "batch_size": BATCH_SIZE,
-        "initial_epochs": EPOCHS,
-        "finetune_epochs": FINE_TUNE_EPOCHS,
-        "learning_rate": LEARNING_RATE,
-        "finetune_lr": 1e-5,
-        "num_classes": len(class_names),
-        "class_names": class_names,
-        "best_val_accuracy": float(best_val_acc),
-        "class_weights": {k: float(v) for k, v in class_weights_dict.items()}
-    }
-    
-    with open(MODEL_DIR / "training_config.json", 'w') as f:
-        json.dump(config, f, indent=2)
-    
-    print(f"\nConfiguration sauvegardée: {MODEL_DIR / 'training_config.json'}")
-    print(f"Meilleur modèle fine-tuné disponible à: {MODEL_DIR / 'best_model_finetuned.keras'}")
-    print(f"Modèle de la phase 1 disponible à: {MODEL_DIR / 'best_model.keras'}")
-    
-    # Mettre à jour best_model.keras avec le meilleur des deux phases
-    best_phase1 = max(history_1.history['val_accuracy'])
-    best_phase2 = max(history_2.history['val_accuracy'])
-    
-    if best_phase2 > best_phase1:
-        print("\nLe modèle fine-tuné est meilleur. Mise à jour de best_model.keras...")
-        import shutil
-        shutil.copy(MODEL_DIR / "best_model_finetuned.keras", MODEL_DIR / "best_model.keras")
-
+    plot_training_history(history_2, RESULTS_DIR / "training_history.png")
+    print("\nTraining complete. Best model saved to models/best_model_finetuned.keras")
 
 if __name__ == "__main__":
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        print(f"GPU détecté: {len(gpus)} device(s)")
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-        except RuntimeError as e:
-            print(e)
-    else:
-        print("Pas de GPU détecté, utilisation du CPU")
-    
-    train_model()
+    main()
